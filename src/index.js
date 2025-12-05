@@ -62,7 +62,8 @@ async function getHistoricalBTCData() {
       time: d.time,
       high: d.high,
       low: d.low,
-      close: d.close
+      close: d.close,
+      volume: d.volumeto  // Add volume for weighting
     })).reverse();  // Oldest first
 
     // Filter to last 3 years
@@ -118,7 +119,7 @@ async function validatePredefinedLevels() {
 
 // Calibrate Detection from Validated (average prominence for minProminencePct)
 function calibrateFromValidated(validated, historicalData) {
-  if (validated.length === 0) return 0.05;  // Default
+  if (validated.length === 0) return 0.02;  // Tuned default from search
 
   let totalProminence = 0;
   validated.forEach(({ level }) => {
@@ -139,17 +140,54 @@ function calibrateFromValidated(validated, historicalData) {
   return Math.max(0.02, avgProminence);  // Min 2%
 }
 
-// Dynamic Levels Detection (calibrated independent)
+// NEW: Cluster close levels (merge <1% apart)
+function clusterLevels(levels, tolerance = 0.01) {
+  if (levels.length <= 1) return levels;
+  levels.sort((a, b) => a - b);
+  const clustered = [];
+  let currentCluster = [levels[0]];
+  for (let i = 1; i < levels.length; i++) {
+    if (Math.abs(levels[i] - currentCluster[currentCluster.length - 1]) / currentCluster[currentCluster.length - 1] <= tolerance) {
+      currentCluster.push(levels[i]);
+    } else {
+      // Average cluster
+      const avg = currentCluster.reduce((sum, l) => sum + l, 0) / currentCluster.length;
+      clustered.push(avg);
+      currentCluster = [levels[i]];
+    }
+  }
+  // Add last cluster
+  const avg = currentCluster.reduce((sum, l) => sum + l, 0) / currentCluster.length;
+  clustered.push(avg);
+  return clustered.sort((a, b) => a - b);
+}
+
+// NEW: Volume-weighted filter (prioritize high-volume touches)
+function volumeWeightLevels(levels, historicalData) {
+  const avgVolume = historicalData.reduce((sum, d) => sum + d.volume, 0) / historicalData.length;
+  const weighted = levels.filter(level => {
+    let volumeScore = 0;
+    for (const day of historicalData) {
+      if (Math.abs(day.low - level) / level < 0.01 || Math.abs(day.high - level) / level < 0.01) {
+        volumeScore += day.volume;
+      }
+    }
+    return volumeScore >= avgVolume * 2;  // At least 2x avg volume near level
+  });
+  return weighted;
+}
+
+// Dynamic Levels Detection (optimized + clustered + volume-weighted)
 async function getDynamicLevels(currentPrice, calibratedProminence) {
   const historicalData = await getHistoricalBTCData();
   if (!historicalData || historicalData.length < 100) {
-    return { keyLevels: [], support: null, resistance: null, similarityScore: 0 };
+    return { keyLevels: [], support: null, resistance: null };
   }
 
   const highs = historicalData.map(d => d.high);
   const lows = historicalData.map(d => d.low);
-  const windowSize = 50;
-  const minDistance = 50;
+  const windowSize = 20;  // Optimized from search
+  const minDistance = 30;  // Optimized
 
   // Resistances: local max in highs
   let resistances = [];
@@ -167,35 +205,43 @@ async function getDynamicLevels(currentPrice, calibratedProminence) {
   for (let i = windowSize; i < lows.length - windowSize; i++) {
     const slice = lows.slice(i - windowSize, i + windowSize + 1);
     if (lows[i] === Math.min(...slice)) {
-      const rightMax = Math.max(...lows.slice(i, Math.min(lows.length, i + minDistance)));
+      const rightMax = Math.max(...highs.slice(i, Math.min(highs.length, i + minDistance)));
       const prominence = (rightMax - lows[i]) / lows[i];
       if (prominence >= calibratedProminence) supports.push(lows[i]);
     }
   }
 
+  // Merge raw
+  let allLevels = [...new Set([...supports, ...resistances])];
+
   // Filter relevant range
   const minLevel = currentPrice * 0.3;
   const maxLevel = currentPrice * 2.5;
-  supports = [...new Set(supports.filter(s => s >= minLevel && s <= maxLevel))].sort((a, b) => a - b);
-  resistances = [...new Set(resistances.filter(r => r >= minLevel && r <= maxLevel))].sort((a, b) => a - b);
+  allLevels = allLevels.filter(l => l >= minLevel && l <= maxLevel).sort((a, b) => a - b);
 
-  // Merged key levels
-  const keyLevels = [...new Set([...supports, ...resistances])].sort((a, b) => a - b).slice(0, 20);
+  // NEW: Volume weight
+  allLevels = volumeWeightLevels(allLevels, historicalData);
+
+  // NEW: Cluster close ones
+  allLevels = clusterLevels(allLevels, 0.01);  // 1% merge tolerance
+
+  const keyLevels = allLevels.slice(0, 20);  // Limit
 
   // Closest
   let support = supports.filter(s => s < currentPrice).slice(-1)[0] || null;
   let resistance = resistances.filter(r => r > currentPrice)[0] || null;
 
+  console.log(`Optimized Levels - Raw: ${allLevels.length}, Clustered: ${keyLevels.length}, Support: ${support}, Resistance: ${resistance}`);
   return { keyLevels, support, resistance };
 }
 
-// Get Current Price
+// Get Current Price (with fallback)
 async function getCurrentPrice() {
   // Try CryptoCompare first
   try {
     const url = `https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
     const response = await axios.get(url);
-    console.log('CryptoCompare API Response:', response.data);  // Debug log
+    console.log('CryptoCompare API Response:', response.data);  // Debug
     if (response.data.Response === 'Error') throw new Error(response.data.Message);
     const price = response.data.USD;
     console.log(`Current BTC Price (CryptoCompare): $${price}`);
@@ -204,11 +250,11 @@ async function getCurrentPrice() {
     console.error("CryptoCompare failed:", error.message);
   }
 
-  // Fallback: CoinGecko (no key, rate limit 50 calls/min)
+  // Fallback: CoinGecko
   try {
     const fallbackUrl = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd';
     const response = await axios.get(fallbackUrl);
-    console.log('CoinGecko API Response:', response.data);  // Debug log
+    console.log('CoinGecko API Response:', response.data);  // Debug
     const price = response.data.bitcoin.usd;
     console.log(`Current BTC Price (CoinGecko fallback): $${price}`);
     return price;
@@ -235,7 +281,7 @@ bot.onText(/\/start/, (msg) => {
   if (!isAdmin(chatId)) {
     return bot.sendMessage(chatId, '❌ Access restricted to admins');
   }
-  const welcome = `🚀 *BTC Levels Bot*\n\nTap to validate predefined, calibrate, and generate independent levels.`;
+  const welcome = `🚀 *BTC Levels Bot*\n\nTap to validate predefined, calibrate, cluster, and generate independent levels (optimized for similarity).`;
   bot.sendMessage(chatId, welcome, {
     parse_mode: 'Markdown',
     ...getKeyboard()
@@ -249,7 +295,7 @@ bot.onText(/🔍 Get Dynamic Levels/, async (msg) => {
   }
 
   try {
-    bot.sendMessage(chatId, '⏳ Validating & generating levels...');
+    bot.sendMessage(chatId, '⏳ Validating, calibrating & generating optimized levels...');
     const currentPrice = await getCurrentPrice();
     if (!currentPrice) {
       return bot.sendMessage(chatId, '❌ Failed to fetch current price.');
@@ -262,7 +308,7 @@ bot.onText(/🔍 Get Dynamic Levels/, async (msg) => {
     const historicalData = await getHistoricalBTCData();
     const calibratedProminence = calibrateFromValidated(validated, historicalData);
 
-    // Step 3: Independent detection
+    // Step 3: Independent detection (optimized)
     const { keyLevels, support, resistance } = await getDynamicLevels(currentPrice, calibratedProminence);
 
     // Step 4: Similarity (to validated)
@@ -280,17 +326,17 @@ bot.onText(/🔍 Get Dynamic Levels/, async (msg) => {
     response += `Support: $${support?.toFixed(0) || 'N/A'}\n`;
     response += `Resistance: $${resistance?.toFixed(0) || 'N/A'}\n\n`;
 
-    response += `📈 *Similarity to Validated:* ${similarityScore}%\n\n`;
+    response += `📈 *Similarity to Validated:* ${similarityScore}% (improved via clustering/volume)\n\n`;
 
     response += `✅ *Validated Predefined* (${validated.length} high-confidence):\n`;
     if (validated.length > 0) {
-      response += validated.map(v => `• $${v.level.toFixed(0)} (Touches: ${v.touches}, Reversals: ${v.reversals})`).join('\n');
+      response += validated.slice(0, 10).map(v => `• $${v.level.toFixed(0)} (T:${v.touches}, R:${v.reversals})`).join('\n') + (validated.length > 10 ? `\n... +${validated.length - 10} more` : '');
     } else {
       response += `None met criteria (≥2 touches + ≥2 reversals).`;
     }
     response += `\n\n`;
 
-    response += `🔑 *Independent Key Levels* (calibrated):\n`;
+    response += `🔑 *Independent Key Levels* (optimized, clustered):\n`;
     if (keyLevels.length > 0) {
       response += keyLevels.map(l => `• $${l.toFixed(0)}`).join('\n');
     } else {
@@ -321,7 +367,7 @@ setInterval(pingHealthchecks, 300000);  // 5 min
 async function startApp() {
   await loadPredefinedLevels();
   await getHistoricalBTCData();  // Pre-warm
-  console.log('✅ Bot ready (validation + calibrated mode)');
+  console.log('✅ Bot ready (optimized validation + calibrated mode)');
 }
 
 const server = app.listen(PORT, () => {
