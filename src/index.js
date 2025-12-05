@@ -54,7 +54,7 @@ async function getHistoricalBTCData() {
   }
 
   const endTime = Math.floor(now / 1000);
-  const startTime = endTime - (1895 * 24 * 60 * 60);  // ~3 years
+  const startTime = endTime - (1095 * 24 * 60 * 60);  // ~3 years
   const url = `https://min-api.cryptocompare.com/data/v2/histoday?fsym=BTC&tsym=USD&limit=2000&toTs=${endTime}&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
   try {
     const response = await axios.get(url);
