@@ -196,7 +196,6 @@ async function getCurrentPrice() {
     const response = await axios.get(url);
     console.log('API Response:', response.data);
     const price = response.data.USD;
-    console.log(`Current BTC Price: $${price}`);
     return price;
   } catch (error) {
     console.error("Error fetching price:", error);
