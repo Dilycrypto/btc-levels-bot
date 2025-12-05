@@ -194,6 +194,7 @@ async function getCurrentPrice() {
   try {
     const url = `https://min-api.cryptocompare.com/data/price?fsym=BTC&tsym=USD&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
     const response = await axios.get(url);
+    console.log('API Response:', response.data);
     const price = response.data.USD;
     console.log(`Current BTC Price: $${price}`);
     return price;
