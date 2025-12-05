@@ -191,14 +191,29 @@ async function getDynamicLevels(currentPrice, calibratedProminence) {
 
 // Get Current Price
 async function getCurrentPrice() {
+  // Try CryptoCompare first
   try {
-    const url = `https://min-api.cryptocompare.com/data/price?fsym=BTC&tsym=USD&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
+    const url = `https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
     const response = await axios.get(url);
-    console.log('API Response:', response.data);
+    console.log('CryptoCompare API Response:', response.data);  // Debug log
+    if (response.data.Response === 'Error') throw new Error(response.data.Message);
     const price = response.data.USD;
+    console.log(`Current BTC Price (CryptoCompare): $${price}`);
     return price;
   } catch (error) {
-    console.error("Error fetching price:", error);
+    console.error("CryptoCompare failed:", error.message);
+  }
+
+  // Fallback: CoinGecko (no key, rate limit 50 calls/min)
+  try {
+    const fallbackUrl = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd';
+    const response = await axios.get(fallbackUrl);
+    console.log('CoinGecko API Response:', response.data);  // Debug log
+    const price = response.data.bitcoin.usd;
+    console.log(`Current BTC Price (CoinGecko fallback): $${price}`);
+    return price;
+  } catch (error) {
+    console.error("CoinGecko fallback failed:", error.message);
     return null;
   }
 }
