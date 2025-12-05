@@ -32,21 +32,21 @@ function isAdmin(chatId) {
   return adminIds.includes(chatId.toString());
 }
 
-// Load Predefined
+// Load Predefined (for validation)
 async function loadPredefinedLevels() {
   try {
     const levelsPath = path.join(__dirname, '../data/levels.json');
     const data = JSON.parse(fs.readFileSync(levelsPath, 'utf8'));
     predefinedLevels = data.levels.sort((a, b) => a - b);
-    console.log(`Loaded ${predefinedLevels.length} predefined levels`);
+    console.log(`Loaded ${predefinedLevels.length} predefined levels for validation`);
   } catch (error) {
-    console.warn("No levels.json—empty predefined");
+    console.warn("No levels.json—skipping validation");
     predefinedLevels = [];
   }
 }
 
-// Historical Data Fetch with Cache
-async function getHistoricalBTCData(daysBack = 730) {
+// Historical Data Fetch with Cache (last 3 years)
+async function getHistoricalBTCData() {
   const now = Date.now();
   if (cachedHistoricalData && lastCacheTime && (now - lastCacheTime) < CACHE_DURATION_MS) {
     console.log('Using cached historical data');
@@ -54,20 +54,25 @@ async function getHistoricalBTCData(daysBack = 730) {
   }
 
   const endTime = Math.floor(now / 1000);
-  const startTime = endTime - (daysBack * 24 * 60 * 60);
+  const startTime = endTime - (1095 * 24 * 60 * 60);  // ~3 years
   const url = `https://min-api.cryptocompare.com/data/v2/histoday?fsym=BTC&tsym=USD&limit=2000&toTs=${endTime}&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
   try {
     const response = await axios.get(url);
-    cachedHistoricalData = response.data.Data.Data.map(d => ({
+    let data = response.data.Data.Data.map(d => ({
       time: d.time,
-      open: d.open,
       high: d.high,
       low: d.low,
       close: d.close
     })).reverse();  // Oldest first
+
+    // Filter to last 3 years
+    const threeYearsAgo = new Date(now - (3 * 365 * 24 * 60 * 60 * 1000)).getTime() / 1000;
+    data = data.filter(d => d.time >= threeYearsAgo);
+
+    cachedHistoricalData = data;
     lastCacheTime = now;
-    console.log(`Fetched/cached historical data (${cachedHistoricalData.length} days)`);
-    return cachedHistoricalData;
+    console.log(`Fetched/cached historical data (${data.length} days, last 3 years)`);
+    return data;
   } catch (error) {
     console.error("Error fetching historical data:", error);
     if (cachedHistoricalData) return cachedHistoricalData;
@@ -75,74 +80,116 @@ async function getHistoricalBTCData(daysBack = 730) {
   }
 }
 
-// Dynamic Levels Detection
-async function getDynamicLevels(currentPrice, usePredefined = true) {
-  const historicalData = await getHistoricalBTCData();
-  if (!historicalData || historicalData.length < 100) {
-    console.error("Insufficient data—using empty dynamic");
-    return { allSupports: [], allResistances: [], support: null, resistance: null };
-  }
+// NEW: Validate Predefined Levels (touches & reversals)
+async function validatePredefinedLevels() {
+  const historicalData = await getHistoricalData();
+  if (!historicalData || predefinedLevels.length === 0) return [];
 
-  const closes = historicalData.map(d => d.close);
-  const windowSize = 20;
-  const minProminencePct = 0.02;
-  const minDistance = 30;
+  const validated = [];
+  const tolerance = 0.01;  // 1% zone
+  const minTouches = 2;
+  const minReversals = 2;
 
-  // Resistances (maxima)
-  let resistances = [];
-  for (let i = windowSize; i < closes.length - windowSize; i++) {
-    const slice = closes.slice(i - windowSize, i + windowSize + 1);
-    if (closes[i] === Math.max(...slice)) {
-      const leftMin = Math.min(...closes.slice(Math.max(0, i - minDistance), i));
-      const prominence = (closes[i] - leftMin) / closes[i];
-      if (prominence >= minProminencePct) resistances.push(closes[i]);
+  for (const level of predefinedLevels) {
+    let touches = 0;
+    let reversals = 0;
+    for (let i = 1; i < historicalData.length; i++) {
+      const prev = historicalData[i - 1];
+      const curr = historicalData[i];
+      const low = Math.min(prev.low, curr.low);
+      const high = Math.max(prev.high, curr.high);
+      // Touch: within zone
+      if (low <= level * (1 + tolerance) && high >= level * (1 - tolerance)) {
+        touches++;
+        // Reversal: close crosses level
+        if ((prev.close < level && curr.close > level) || (prev.close > level && curr.close < level)) {
+          reversals++;
+        }
+      }
+    }
+    if (touches >= minTouches && reversals >= minReversals) {
+      validated.push({ level, touches, reversals });
     }
   }
 
-  // Supports (minima)
-  let supports = [];
-  for (let i = windowSize; i < closes.length - windowSize; i++) {
-    const slice = closes.slice(i - windowSize, i + windowSize + 1);
-    if (closes[i] === Math.min(...slice)) {
-      const rightMax = Math.max(...closes.slice(i, Math.min(closes.length, i + minDistance)));
-      const prominence = (rightMax - closes[i]) / closes[i];
-      if (prominence >= minProminencePct) supports.push(closes[i]);
-    }
-  }
-
-  // Recent filter & dedupe
-  const recentCloses = closes.slice(-closes.length / 2);
-  supports = [...new Set(supports.filter(s => recentCloses.includes(s)))].sort((a, b) => a - b);
-  resistances = [...new Set(resistances.filter(r => recentCloses.includes(r)))].sort((a, b) => a - b);
-
-  // Hybrid merge
-  let allSupports = supports;
-  let allResistances = resistances;
-  if (usePredefined && predefinedLevels.length > 0) {
-    const tolerance = 0.05;  // 5%
-    predefinedLevels.forEach(level => {
-      const nearbySupports = supports.filter(s => Math.abs(s - level) / level <= tolerance);
-      const nearbyResistances = resistances.filter(r => Math.abs(r - level) / level <= tolerance);
-      if (nearbySupports.length === 0) allSupports.push(level);
-      if (nearbyResistances.length === 0) allResistances.push(level);
-    });
-    allSupports = [...new Set(allSupports)].sort((a, b) => a - b);
-    allResistances = [...new Set(allResistances)].sort((a, b) => a - b);
-  }
-
-  // Limit to top 10
-  allSupports = allSupports.slice(-10);
-  allResistances = allResistances.slice(0, 10);
-
-  // Closest to current price
-  let support = allSupports.filter(s => s < currentPrice).slice(-1)[0] || null;
-  let resistance = allResistances.filter(r => r > currentPrice)[0] || null;
-
-  console.log(`Dynamic Levels - Support: ${support}, Resistance: ${resistance}`);
-  return { allSupports, allResistances, support, resistance };
+  console.log(`Validated ${validated.length}/${predefinedLevels.length} levels`);
+  return validated.sort((a, b) => a.level - b.level);
 }
 
-// Get Current Price (simple fallback to CryptoCompare)
+// Calibrate Detection from Validated (average prominence for minProminencePct)
+function calibrateFromValidated(validated, historicalData) {
+  if (validated.length === 0) return 0.05;  // Default
+
+  let totalProminence = 0;
+  validated.forEach(({ level }) => {
+    // Approx prominence: avg swing around level
+    let swings = [];
+    for (let i = 0; i < historicalData.length - 1; i++) {
+      const curr = historicalData[i];
+      if (Math.abs(curr.low - level) / level < 0.02 || Math.abs(curr.high - level) / level < 0.02) {
+        const next = historicalData[i + 1];
+        swings.push(Math.abs(next.close - curr.close) / level);
+      }
+    }
+    totalProminence += swings.length > 0 ? swings.reduce((a, b) => a + b, 0) / swings.length : 0;
+  });
+
+  const avgProminence = totalProminence / validated.length;
+  console.log(`Calibrated minProminencePct: ${avgProminence.toFixed(3)} from validated`);
+  return Math.max(0.02, avgProminence);  // Min 2%
+}
+
+// Dynamic Levels Detection (calibrated independent)
+async function getDynamicLevels(currentPrice, calibratedProminence) {
+  const historicalData = await getHistoricalData();
+  if (!historicalData || historicalData.length < 100) {
+    return { keyLevels: [], support: null, resistance: null, similarityScore: 0 };
+  }
+
+  const highs = historicalData.map(d => d.high);
+  const lows = historicalData.map(d => d.low);
+  const windowSize = 50;
+  const minDistance = 50;
+
+  // Resistances: local max in highs
+  let resistances = [];
+  for (let i = windowSize; i < highs.length - windowSize; i++) {
+    const slice = highs.slice(i - windowSize, i + windowSize + 1);
+    if (highs[i] === Math.max(...slice)) {
+      const leftMin = Math.min(...highs.slice(Math.max(0, i - minDistance), i));
+      const prominence = (highs[i] - leftMin) / highs[i];
+      if (prominence >= calibratedProminence) resistances.push(highs[i]);
+    }
+  }
+
+  // Supports: local min in lows
+  let supports = [];
+  for (let i = windowSize; i < lows.length - windowSize; i++) {
+    const slice = lows.slice(i - windowSize, i + windowSize + 1);
+    if (lows[i] === Math.min(...slice)) {
+      const rightMax = Math.max(...lows.slice(i, Math.min(lows.length, i + minDistance)));
+      const prominence = (rightMax - lows[i]) / lows[i];
+      if (prominence >= calibratedProminence) supports.push(lows[i]);
+    }
+  }
+
+  // Filter relevant range
+  const minLevel = currentPrice * 0.3;
+  const maxLevel = currentPrice * 2.5;
+  supports = [...new Set(supports.filter(s => s >= minLevel && s <= maxLevel))].sort((a, b) => a - b);
+  resistances = [...new Set(resistances.filter(r => r >= minLevel && r <= maxLevel))].sort((a, b) => a - b);
+
+  // Merged key levels
+  const keyLevels = [...new Set([...supports, ...resistances])].sort((a, b) => a - b).slice(0, 20);
+
+  // Closest
+  let support = supports.filter(s => s < currentPrice).slice(-1)[0] || null;
+  let resistance = resistances.filter(r => r > currentPrice)[0] || null;
+
+  return { keyLevels, support, resistance };
+}
+
+// Get Current Price
 async function getCurrentPrice() {
   try {
     const url = `https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
@@ -173,7 +220,7 @@ bot.onText(/\/start/, (msg) => {
   if (!isAdmin(chatId)) {
     return bot.sendMessage(chatId, '❌ Access restricted to admins');
   }
-  const welcome = `🚀 *BTC Levels Bot*\n\nTap to get dynamic support/resistance levels.`;
+  const welcome = `🚀 *BTC Levels Bot*\n\nTap to validate predefined, calibrate, and generate independent levels.`;
   bot.sendMessage(chatId, welcome, {
     parse_mode: 'Markdown',
     ...getKeyboard()
@@ -187,39 +234,61 @@ bot.onText(/🔍 Get Dynamic Levels/, async (msg) => {
   }
 
   try {
-    bot.sendMessage(chatId, '⏳ Fetching levels...');
+    bot.sendMessage(chatId, '⏳ Validating & generating levels...');
     const currentPrice = await getCurrentPrice();
     if (!currentPrice) {
       return bot.sendMessage(chatId, '❌ Failed to fetch current price.');
     }
 
-    const { allSupports, allResistances, support, resistance } = await getDynamicLevels(currentPrice, true);
+    // Step 1: Validate predefined
+    const validated = await validatePredefinedLevels();
+
+    // Step 2: Calibrate
+    const calibratedProminence = calibrateFromValidated(validated, await getHistoricalData());
+
+    // Step 3: Independent detection
+    const { keyLevels, support, resistance } = await getDynamicLevels(currentPrice, calibratedProminence);
+
+    // Step 4: Similarity (to validated)
+    let similarityScore = 0;
+    if (validated.length > 0) {
+      const tolerance = 0.02;
+      const matches = keyLevels.filter(detected => 
+        validated.some(v => Math.abs(detected - v.level) / v.level <= tolerance)
+      );
+      similarityScore = ((matches.length / keyLevels.length) * 100).toFixed(1);
+    }
 
     let response = `📊 *BTC Levels Report* (Price: $${currentPrice.toFixed(2)})\n\n`;
-    response += `🎯 *Closest:*\n`;
-    response += `Support: $${support || 'N/A'}\n`;
-    response += `Resistance: $${resistance || 'N/A'}\n\n`;
+    response += `🎯 *Closest (Independent):*\n`;
+    response += `Support: $${support?.toFixed(0) || 'N/A'}\n`;
+    response += `Resistance: $${resistance?.toFixed(0) || 'N/A'}\n\n`;
 
-    response += `📋 *Predefined Levels (from JSON):*\n`;
-    if (predefinedLevels.length > 0) {
-      response += predefinedLevels.slice(0, 10).map(l => `• $${l.toFixed(0)}`).join('\n') + (predefinedLevels.length > 10 ? `\n... +${predefinedLevels.length - 10} more` : '');
+    response += `📈 *Similarity to Validated:* ${similarityScore}%\n\n`;
+
+    response += `✅ *Validated Predefined* (${validated.length} high-confidence):\n`;
+    if (validated.length > 0) {
+      response += validated.map(v => `• $${v.level.toFixed(0)} (Touches: ${v.touches}, Reversals: ${v.reversals})`).join('\n');
     } else {
-      response += `None loaded.`;
+      response += `None met criteria (≥2 touches + ≥2 reversals).`;
     }
     response += `\n\n`;
 
-    response += `🔄 *Dynamic Levels (Detected + Blended):*\n`;
-    response += `Supports:\n${allSupports.map(s => `• $${s.toFixed(0)}`).join('\n') || 'None'}\n\n`;
-    response += `Resistances:\n${allResistances.map(r => `• $${r.toFixed(0)}`).join('\n') || 'None'}`;
+    response += `🔑 *Independent Key Levels* (calibrated):\n`;
+    if (keyLevels.length > 0) {
+      response += keyLevels.map(l => `• $${l.toFixed(0)}`).join('\n');
+    } else {
+      response += `No levels detected.`;
+    }
 
     bot.sendMessage(chatId, response, { parse_mode: 'Markdown', ...getKeyboard() });
   } catch (error) {
-    console.error("Error generating levels:", error);
+    console.error("Error:", error);
     bot.sendMessage(chatId, `❌ Error: ${error.message}`, getKeyboard());
   }
 });
 
-// Health Ping (optional)
+// Health Ping
 async function pingHealthchecks() {
   if (!process.env.HEALTHCHECKS_UUID) return;
   try {
@@ -235,8 +304,8 @@ setInterval(pingHealthchecks, 300000);  // 5 min
 // Startup
 async function startApp() {
   await loadPredefinedLevels();
-  await getHistoricalBTCData();  // Pre-warm cache
-  console.log('✅ Bot ready');
+  await getHistoricalData();  // Pre-warm
+  console.log('✅ Bot ready (validation + calibrated mode)');
 }
 
 const server = app.listen(PORT, () => {
