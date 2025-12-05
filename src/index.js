@@ -80,9 +80,9 @@ async function getHistoricalBTCData() {
   }
 }
 
-// NEW: Validate Predefined Levels (touches & reversals)
+// Validate Predefined Levels (touches & reversals)
 async function validatePredefinedLevels() {
-  const historicalData = await getHistoricalData();
+  const historicalData = await getHistoricalBTCData();
   if (!historicalData || predefinedLevels.length === 0) return [];
 
   const validated = [];
@@ -141,7 +141,7 @@ function calibrateFromValidated(validated, historicalData) {
 
 // Dynamic Levels Detection (calibrated independent)
 async function getDynamicLevels(currentPrice, calibratedProminence) {
-  const historicalData = await getHistoricalData();
+  const historicalData = await getHistoricalBTCData();
   if (!historicalData || historicalData.length < 100) {
     return { keyLevels: [], support: null, resistance: null, similarityScore: 0 };
   }
@@ -192,7 +192,7 @@ async function getDynamicLevels(currentPrice, calibratedProminence) {
 // Get Current Price
 async function getCurrentPrice() {
   try {
-    const url = `https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
+    const url = `https://min-api.cryptocompare.com/data/price?fsym=BTC&tsym=USD&api_key=${process.env.CRYPTOCOMPARE_API_KEY}`;
     const response = await axios.get(url);
     const price = response.data.USD;
     console.log(`Current BTC Price: $${price}`);
@@ -244,14 +244,15 @@ bot.onText(/🔍 Get Dynamic Levels/, async (msg) => {
     const validated = await validatePredefinedLevels();
 
     // Step 2: Calibrate
-    const calibratedProminence = calibrateFromValidated(validated, await getHistoricalData());
+    const historicalData = await getHistoricalBTCData();
+    const calibratedProminence = calibrateFromValidated(validated, historicalData);
 
     // Step 3: Independent detection
     const { keyLevels, support, resistance } = await getDynamicLevels(currentPrice, calibratedProminence);
 
     // Step 4: Similarity (to validated)
     let similarityScore = 0;
-    if (validated.length > 0) {
+    if (validated.length > 0 && keyLevels.length > 0) {
       const tolerance = 0.02;
       const matches = keyLevels.filter(detected => 
         validated.some(v => Math.abs(detected - v.level) / v.level <= tolerance)
@@ -304,7 +305,7 @@ setInterval(pingHealthchecks, 300000);  // 5 min
 // Startup
 async function startApp() {
   await loadPredefinedLevels();
-  await getHistoricalData();  // Pre-warm
+  await getHistoricalBTCData();  // Pre-warm
   console.log('✅ Bot ready (validation + calibrated mode)');
 }
 
